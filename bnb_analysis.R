@@ -1,6 +1,6 @@
 ##### FINAL PROJECT
 
-bnb= read.csv("/Users/andresperez/Desktop/R Files/bnb_project/Torerobnb_listing_rev.csv")
+bnb = read.csv("/Users/andresperez/Desktop/R Files/bnb_project/data/bnb_listing_rev.csv")
 
 #### data cleaning
 
