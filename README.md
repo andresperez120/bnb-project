@@ -16,6 +16,53 @@ This project explores and predicts Airbnb listing prices in New York City using 
 - `visualizations/`: Contains generated plots and figures
 - `README.md`: Project overview and instructions
 
+## Model Performance Summary
+
+| Model                | Dataset      | RMSE   | MAE   | R²     |
+|----------------------|-------------|--------|-------|--------|
+| **Baseline (Linear)**| Test        | ~58    | ~32   | ~0.82  |
+|                      | Evaluation  | ~58    | ~32   | ~0.81  |
+| **Random Forest**    | Test        | ~21    | ~7    | ~0.98  |
+|                      | Evaluation  | ~21    | ~7    | ~0.98  |
+| **XGBoost**          | Test        | ~5     | ~1.5  | ~0.999 |
+|                      | Evaluation  | ~5.5   | ~1.4  | ~0.998 |
+
+*Values are approximate, based on reported results.*
+
+## Data Splitting Approach
+- **Training Set (60%)**: Used to fit all models and perform feature engineering.
+- **Test Set (20%)**: Used to evaluate model performance during development and compare different models.
+- **Evaluation Set (20%)**: Held out and used only for the final, unbiased assessment of model performance. This ensures that reported results are not overfitted or biased by repeated testing.
+
+## Findings from Each File
+
+### NYC_Airbnb_EDA.Rmd
+- **Purpose:** Exploratory Data Analysis (EDA)
+- **Findings:**
+  - Price distribution is right-skewed, with most listings under $300/night.
+  - Key drivers of price: room type, location (borough/neighborhood), number of bedrooms/bathrooms.
+  - Engineered features (e.g., bed efficiency, price per person, distance from center) help explain price variation.
+   - `bed_efficiency = beds / accommodates`
+   - `price_per_person = price / accommodates`
+   - `distance_from_center = sqrt((latitude - 40.7128)^2 + (longitude - (-74.0060))^2)`
+
+  - Visualizations revealed trends and outliers, guiding feature selection for modeling.
+
+### NYC_Airbnb_Baseline_Models.Rmd
+- **Purpose:** Baseline predictive modeling using linear regression.
+- **Findings:**
+  - Linear regression with engineered features explained most price variation (R² ~0.82).
+  - Location and room type were the most important predictors.
+  - Residual analysis showed higher error for expensive listings, suggesting room for improvement with more complex models.
+
+### NYC_Airbnb_Model_Improvements.Rmd
+- **Purpose:** Advanced modeling and model comparison.
+- **Findings:**
+  - Random Forest and XGBoost models significantly improved accuracy (R² up to ~0.999).
+  - Residual plots showed good generalization and no overfitting.
+  - Feature importance analysis confirmed the value of engineered features and location.
+  - The models are robust and ready for business use.
+
 ## Key Results
 - **EDA:** Identified key drivers of price (room type, location, bedrooms/bathrooms). Engineered features like bed efficiency and distance from center improved understanding.
 - **Baseline Model:** Linear regression explained most price variation (Test RMSE ~58, R² ~0.82). Location and room type were top predictors.
