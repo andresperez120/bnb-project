@@ -47,7 +47,6 @@ This project demonstrates a full data science workflow for NYC Airbnb price pred
 
 ---
 
-**For questions or collaboration, please contact the project author.**
 
 ## Reproduce
 1. Install R and required packages:
