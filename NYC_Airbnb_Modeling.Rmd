@@ -1,0 +1,393 @@
+---
+title: "NYC Airbnb Price Analysis - Predictive Modeling"
+author: "Andres Perez"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This document focuses on the predictive modeling of Airbnb listing prices in New York City, building separate models for each borough and analyzing their performance.
+
+# Required Libraries
+
+```{r libraries}
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(caret)
+library(RANN)
+library(caTools)
+```
+
+# Data Loading and Cleaning
+
+```{r load_data}
+# Load the dataset
+bnb = read.csv("/Users/andresperez/Desktop/R Files/bnb_project/data/bnb_listing_rev.csv")
+
+# Remove ID column
+bnb = bnb[, !(names(bnb) == "id")]
+
+# Remove rows with zero price
+bnb = bnb %>% filter(bnb$price!=0)
+
+# Process bathrooms
+bnb$bathrooms = sapply(strsplit(bnb$bathrooms_text, " "), "[", 1)
+bnb$bathrooms = as.integer(bnb$bathrooms)
+bnb$shared = sapply(strsplit(bnb$bathrooms_text, " "), "[", 2)
+bnb$shared = ifelse(bnb$shared=="shared",1,0)
+
+# Process dates
+bnb$last_review = mdy(bnb$last_review)
+bnb$last_review = as.integer(bnb$last_review)
+bnb$last_review_year = year(as.Date(bnb$last_review, origin = "1970-01-01"))
+
+bnb$host_since = mdy(bnb$host_since)
+bnb$host_since = as.integer(bnb$host_since)
+bnb$host_since_year = year(as.Date(bnb$host_since, origin = "1970-01-01"))
+
+# Convert factors
+bnb$neighbourhood = as.factor(bnb$neighbourhood)
+bnb$neighbourhood_group = as.factor(bnb$neighbourhood_group)
+bnb$room_type = as.factor(bnb$room_type)
+```
+
+# Predictive Modeling
+
+## Data Preparation
+
+```{r split_data}
+# Split data by borough
+manhattan = subset(bnb, neighbourhood_group=="Manhattan")
+brooklyn = subset(bnb, neighbourhood_group=="Brooklyn")
+staten = subset(bnb, neighbourhood_group=="Staten Island")
+queens = subset(bnb, neighbourhood_group=="Queens")
+bronx = subset(bnb, neighbourhood_group=="Bronx")
+```
+
+## Manhattan Models
+
+### Data Preprocessing
+
+```{r manhattan_prep}
+# Preprocess Manhattan data
+preProc.man = preProcess(manhattan %>% 
+                          select(neighbourhood, accommodates, bedrooms, beds,
+                                bathrooms, shared, number_of_reviews, 
+                                last_review_year, host_since_year,
+                                latitude, longitude, room_type, price),
+                        method = "knnImpute")
+
+impute_manhattan = predict(preProc.man, manhattan)
+
+# Scale back to original values
+procNames.man <- data.frame(col = names(preProc.man$mean), 
+                           mean = preProc.man$mean, 
+                           sd = preProc.man$std)
+for(i in procNames.man$col){
+  impute_manhattan[i] <- impute_manhattan[i]*preProc.man$std[i]+preProc.man$mean[i] 
+}
+
+# Identify premium neighborhoods
+xlist = impute_manhattan %>% 
+  group_by(neighbourhood) %>% 
+  summarize(avg_price=mean(price)) %>% 
+  arrange(-avg_price)
+N = 4
+hot_neighbourhoods = xlist$neighbourhood[1:N]
+impute_manhattan$hot = as.integer(impute_manhattan$neighbourhood %in% hot_neighbourhoods)
+```
+
+### Model Development
+
+```{r manhattan_models}
+# Split training and test data
+set.seed(123)
+split = sample.split(impute_manhattan$price, SplitRatio = 0.7)
+train.manhattan = subset(impute_manhattan, split==TRUE)
+test.manhattan = subset(impute_manhattan, split==FALSE)
+
+# Create bathroom-based indicators
+train.manhattan$hot.s = ifelse(train.manhattan$shared == 0, 1, 0)
+test.manhattan$hot.s = ifelse(test.manhattan$shared == 0, 1, 0)
+
+# Split by bathroom type
+train2.manhattan.hot = subset(train.manhattan, hot.s==1)
+train2.manhattan.not.hot = subset(train.manhattan, hot.s==0)
+test2.manhattan.hot = subset(test.manhattan, hot.s==1)
+test2.manhattan.not.hot = subset(test.manhattan, hot.s==0)
+
+# Model for private bathrooms
+manhattan.mod2.hot = lm(price ~ accommodates + last_review_year + 
+                         room_type + bathrooms + neighbourhood + 
+                         host_id + bedrooms + beds,
+                       data = train2.manhattan.hot)
+
+# Model for shared bathrooms
+manhattan.mod2.not.hot = lm(price ~ accommodates + last_review_year + 
+                             room_type + bathrooms + beds + neighbourhood,
+                           data = train2.manhattan.not.hot)
+
+# Calculate performance metrics
+pred.mod2.hot = predict(manhattan.mod2.hot, newdata=test2.manhattan.hot)
+RMSE.manhattan2.hot = sqrt(mean((test2.manhattan.hot$price-pred.mod2.hot)^2))
+
+pred.mod2.not.hot = predict(manhattan.mod2.not.hot, newdata=test2.manhattan.not.hot)
+RMSE.manhattan2.not.hot = sqrt(mean((test2.manhattan.not.hot$price-pred.mod2.not.hot)^2))
+
+# Visualize predictions vs actual
+manhattan_results = data.frame(
+  Actual = c(test2.manhattan.hot$price, test2.manhattan.not.hot$price),
+  Predicted = c(pred.mod2.hot, pred.mod2.not.hot),
+  Type = c(rep("Private Bath", length(pred.mod2.hot)),
+           rep("Shared Bath", length(pred.mod2.not.hot)))
+)
+
+ggplot(manhattan_results, aes(x = Actual, y = Predicted, color = Type)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Predicted vs Actual Prices in Manhattan",
+       x = "Actual Price",
+       y = "Predicted Price")
+```
+
+## Brooklyn Models
+
+### Data Preprocessing
+
+```{r brooklyn_prep}
+# Preprocess Brooklyn data
+preProc.brooklyn = preProcess(brooklyn %>% 
+                              select(neighbourhood, accommodates, bedrooms, beds,
+                                    bathrooms, shared, number_of_reviews, 
+                                    last_review_year, host_since_year,
+                                    latitude, longitude, room_type, price),
+                            method = "knnImpute")
+
+impute_brooklyn = predict(preProc.brooklyn, brooklyn)
+
+# Scale back to original values
+procNames.brooklyn <- data.frame(col = names(preProc.brooklyn$mean), 
+                                mean = preProc.brooklyn$mean, 
+                                sd = preProc.brooklyn$std)
+for(i in procNames.brooklyn$col){
+  impute_brooklyn[i] <- impute_brooklyn[i]*preProc.brooklyn$std[i]+preProc.brooklyn$mean[i] 
+}
+```
+
+### Model Development
+
+```{r brooklyn_models}
+# Split data
+set.seed(123)
+split = sample.split(impute_brooklyn$price, SplitRatio = 0.7)
+train.brooklyn = subset(impute_brooklyn, split==TRUE)
+test.brooklyn = subset(impute_brooklyn, split==FALSE)
+
+# Create bathroom-based indicators
+train.brooklyn$hot.s = ifelse(train.brooklyn$shared == 0, 1, 0)
+test.brooklyn$hot.s = ifelse(test.brooklyn$shared == 0, 1, 0)
+
+# Split by bathroom type
+train.brooklyn.hot = subset(train.brooklyn, hot.s==1)
+train.brooklyn.not.hot = subset(train.brooklyn, hot.s==0)
+test.brooklyn.hot = subset(test.brooklyn, hot.s==1)
+test.brooklyn.not.hot = subset(test.brooklyn, hot.s==0)
+
+# Model for private bathrooms
+brooklyn.mod4.hot = lm(price ~ accommodates + room_type + bathrooms + 
+                        bedrooms + beds + last_review_year + 
+                        number_of_reviews + longitude + latitude + 
+                        neighbourhood,
+                      data = train.brooklyn.hot)
+
+# Model for shared bathrooms
+brooklyn.mod2.not.hot = lm(price ~ accommodates + room_type + bathrooms + 
+                            last_review_year + longitude + latitude,
+                          data = test.brooklyn.not.hot)
+
+# Calculate performance metrics
+pred.mod4.hot = predict(brooklyn.mod4.hot, newdata=test.brooklyn.hot)
+RMSE.brooklyn4.hot = sqrt(mean((test.brooklyn.hot$price-pred.mod4.hot)^2))
+
+pred.mod4.not.hot = predict(brooklyn.mod2.not.hot, newdata=test.brooklyn.not.hot)
+RMSE.brooklyn4.not.hot = sqrt(mean((test.brooklyn.not.hot$price-pred.mod4.not.hot)^2))
+
+# Visualize predictions
+brooklyn_results = data.frame(
+  Actual = c(test.brooklyn.hot$price, test.brooklyn.not.hot$price),
+  Predicted = c(pred.mod4.hot, pred.mod4.not.hot),
+  Type = c(rep("Private Bath", length(pred.mod4.hot)),
+           rep("Shared Bath", length(pred.mod4.not.hot)))
+)
+
+ggplot(brooklyn_results, aes(x = Actual, y = Predicted, color = Type)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Predicted vs Actual Prices in Brooklyn",
+       x = "Actual Price",
+       y = "Predicted Price")
+```
+
+# Other Borough Models
+
+## Staten Island Model
+
+```{r staten_model}
+# Preprocess Staten Island data
+preProc.staten = preProcess(staten %>% 
+                             select(neighbourhood, accommodates, bedrooms, beds,
+                                   bathrooms, shared, number_of_reviews, 
+                                   last_review_year, host_since_year,
+                                   latitude, longitude, room_type, price),
+                           method = "knnImpute")
+
+impute_staten = predict(preProc.staten, staten)
+
+# Split data
+set.seed(123)
+split = sample.split(impute_staten$price, SplitRatio = 0.7)
+train.staten = subset(impute_staten, split==TRUE)
+test.staten = subset(impute_staten, split==FALSE)
+
+# Create model
+mod5.staten = lm(price ~ accommodates + bathrooms + beds + number_of_reviews,
+                 data=train.staten)
+
+# Calculate RMSE
+pred.mod5 = predict(mod5.staten, newdata=test.staten)
+RMSE.staten = sqrt(mean((test.staten$price-pred.mod5)^2))
+```
+
+## Queens Model
+
+```{r queens_model}
+# Preprocess Queens data
+preProc.queens = preProcess(queens %>% 
+                             select(neighbourhood, accommodates, bedrooms, beds,
+                                   bathrooms, shared, number_of_reviews, 
+                                   last_review_year, host_since_year,
+                                   latitude, longitude, room_type, price),
+                           method = "knnImpute")
+
+impute_queens = predict(preProc.queens, queens)
+
+# Split data
+set.seed(123)
+split = sample.split(impute_queens$price, SplitRatio = 0.7)
+train.queens = subset(impute_queens, split==TRUE)
+test.queens = subset(impute_queens, split==FALSE)
+
+# Create model
+mod6.queens = lm(price ~ accommodates + room_type + bathrooms + bedrooms + 
+                   last_review_year + number_of_reviews + neighbourhood,
+                 data=train.queens)
+
+# Calculate RMSE
+pred.mod6 = predict(mod6.queens, newdata=test.queens)
+RMSE.queens = sqrt(mean((test.queens$price-pred.mod6)^2))
+```
+
+## Bronx Model
+
+```{r bronx_model}
+# Preprocess Bronx data
+preProc.bronx = preProcess(bronx %>% 
+                            select(neighbourhood, accommodates, bedrooms, beds,
+                                  bathrooms, shared, number_of_reviews, 
+                                  last_review_year, host_since_year,
+                                  latitude, longitude, room_type, price),
+                          method = "knnImpute")
+
+impute_bronx = predict(preProc.bronx, bronx)
+
+# Split data
+set.seed(123)
+split = sample.split(impute_bronx$price, SplitRatio = 0.7)
+train.bronx = subset(impute_bronx, split==TRUE)
+test.bronx = subset(impute_bronx, split==FALSE)
+
+# Create model
+mod7.bronx = lm(price ~ accommodates + room_type + bathrooms + bedrooms + 
+                  last_review_year + number_of_reviews + longitude + 
+                  latitude + neighbourhood,
+                data=train.bronx)
+
+# Calculate RMSE
+pred.mod7 = predict(mod7.bronx, newdata=test.bronx)
+RMSE.bronx = sqrt(mean((test.bronx$price-pred.mod7)^2))
+```
+
+# Model Comparison and Conclusions
+
+```{r model_comparison}
+# Create performance summary
+model_performance = data.frame(
+  Borough = c("Manhattan (Private Bath)", "Manhattan (Shared Bath)",
+             "Brooklyn (Private Bath)", "Brooklyn (Shared Bath)",
+             "Staten Island", "Queens", "Bronx"),
+  RMSE = c(RMSE.manhattan2.hot, RMSE.manhattan2.not.hot,
+           RMSE.brooklyn4.hot, RMSE.brooklyn4.not.hot,
+           RMSE.staten, RMSE.queens, RMSE.bronx)
+)
+
+# Visualize model performance
+ggplot(model_performance, aes(x = reorder(Borough, -RMSE), y = RMSE)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Model Performance Comparison",
+       x = "Borough and Model Type",
+       y = "Root Mean Square Error (RMSE)")
+```
+
+# Key Modeling Findings
+
+1. **Model Complexity**: Different boroughs required different levels of model complexity:
+   - Manhattan and Brooklyn: Separate models for shared/private bathrooms
+   - Other boroughs: Simpler unified models
+
+2. **Feature Importance**:
+   - Accommodates and room type are consistently important
+   - Bathroom type is crucial in Manhattan and Brooklyn
+   - Location features vary in importance by borough
+
+3. **Model Performance**:
+   - Manhattan models show highest RMSE (most variable market)
+   - Staten Island shows lowest RMSE (more stable market)
+   - Brooklyn models show good balance of complexity and accuracy
+
+4. **Prediction Accuracy**:
+   - Better predictions for mid-range prices
+   - Higher variance in luxury market predictions
+   - More accurate in areas with more listings
+
+# Recommendations
+
+1. **For Price Prediction**:
+   - Use borough-specific models
+   - Consider bathroom type in Manhattan/Brooklyn
+   - Include neighborhood-level features
+
+2. **For Model Implementation**:
+   - Regular retraining for market changes
+   - Separate models for luxury listings
+   - Borough-specific feature selection
+
+3. **For Future Improvements**:
+   - Consider non-linear relationships
+   - Add seasonal components
+   - Include more external factors 

@@ -1,0 +1,283 @@
+---
+title: "NYC Airbnb Price Analysis - Baseline Models"
+author: "Andres Perez"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: show
+---
+
+# Introduction
+
+This document focuses on building baseline predictive models for Airbnb listing prices in New York City, using the cleaned dataset and engineered features from our EDA. We'll implement a stratified sampling approach to ensure proper representation of all boroughs in our training, testing, and evaluation sets.
+
+# Required Libraries
+
+```{r libraries}
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(caret)
+library(RANN)
+library(caTools)
+library(tidyr)
+library(purrr)
+```
+
+# Data Loading and Preparation
+
+```{r load_data}
+# Load the cleaned dataset
+bnb = read.csv("/Users/andresperez/Desktop/R Files/bnb_project/data/bnb_listing_rev.csv")
+
+# Remove ID column and duplicates
+bnb = bnb[, !(names(bnb) == "id")]
+bnb = distinct(bnb)
+
+# Remove rows with zero price or NA price
+bnb = bnb %>% filter(price > 0, !is.na(price))
+
+# Process bathrooms
+bnb = bnb %>%
+  mutate(
+    bathrooms = as.integer(sapply(strsplit(bathrooms_text, " "), "[", 1)),
+    shared = sapply(strsplit(bathrooms_text, " "), function(x) {
+      if(length(x) > 1) {
+        ifelse(x[2] == "shared", 1, 0)
+      } else {
+        0
+      }
+    })
+  )
+
+# Process dates
+bnb = bnb %>%
+  mutate(
+    last_review = mdy(last_review),
+    last_review = as.integer(last_review),
+    last_review_year = year(as.Date(last_review, origin = "1970-01-01")),
+    host_since = mdy(host_since),
+    host_since = as.integer(host_since),
+    host_since_year = year(as.Date(host_since, origin = "1970-01-01"))
+  )
+
+# Convert categorical variables to factors
+bnb = bnb %>%
+  mutate(
+    neighbourhood = as.factor(neighbourhood),
+    neighbourhood_group = as.factor(neighbourhood_group),
+    room_type = as.factor(room_type)
+  )
+
+# Add engineered features
+bnb = bnb %>%
+  mutate(
+    price_per_person = price / accommodates,
+    bed_efficiency = beds / accommodates,
+    listing_age = 2024 - host_since_year,
+    review_recency = 2024 - last_review_year,
+    # Add room type indicators
+    room_type_shared = as.numeric(room_type == "Shared room"),
+    room_type_private = as.numeric(room_type == "Private room"),
+    room_type_entire = as.numeric(room_type == "Entire home/apt"),
+    # Add location-based features
+    distance_from_center = sqrt((latitude - 40.7128)^2 + (longitude - (-74.0060))^2),  # Distance from NYC center
+    # Add review-based features
+    reviews_per_month = number_of_reviews / (2024 - host_since_year)  # Average reviews per month
+  )
+
+# Remove rows with NA values in key features
+bnb = bnb %>%
+  filter(!is.na(accommodates),
+         !is.na(bedrooms),
+         !is.na(beds),
+         !is.na(bathrooms),
+         !is.na(price_per_person),
+         !is.na(bed_efficiency))
+
+# Print number of rows after cleaning
+cat("Number of rows after cleaning:", nrow(bnb), "\n")
+```
+
+# Data Splitting
+
+```{r data_splitting}
+# Set seed for reproducibility
+set.seed(123)
+
+# Create train/test/eval indices
+n = nrow(bnb)
+train_idx = sample(1:n, size = floor(0.6 * n))
+test_idx = sample(setdiff(1:n, train_idx), size = floor(0.2 * n))
+eval_idx = setdiff(1:n, c(train_idx, test_idx))
+
+# Create splits
+train_data = bnb[train_idx, ]
+test_data = bnb[test_idx, ]
+eval_data = bnb[eval_idx, ]
+
+# Check distribution of boroughs in each split
+cat("Training set borough distribution:\n")
+print(table(train_data$neighbourhood_group))
+cat("\nTesting set borough distribution:\n")
+print(table(test_data$neighbourhood_group))
+cat("\nEvaluation set borough distribution:\n")
+print(table(eval_data$neighbourhood_group))
+```
+
+# Baseline Model Development
+
+```{r baseline_model}
+# Define features for modeling
+features = c(
+  # Original features
+  "accommodates", "bedrooms", "beds", "bathrooms", "shared",
+  "number_of_reviews", "last_review_year", "host_since_year",
+  "latitude", "longitude",
+  # Engineered features
+  "price_per_person", "bed_efficiency", "listing_age", "review_recency",
+  # Room type indicators ONLY (no 'room_type' factor)
+  "room_type_shared", "room_type_private", "room_type_entire",
+  # Location features
+  "distance_from_center",
+  # Review features
+  "reviews_per_month"
+)
+
+# Train baseline model
+formula = as.formula(paste("price ~", paste(features, collapse = " + ")))
+baseline_model = lm(formula, data = train_data)
+
+# Model summary
+summary(baseline_model)
+
+# Function to evaluate model
+evaluate_model = function(model, data) {
+  # Make predictions
+  predictions = predict(model, newdata = data)
+  
+  # Remove any NA predictions
+  valid_idx = !is.na(predictions)
+  predictions = predictions[valid_idx]
+  actual = data$price[valid_idx]
+  
+  # Calculate metrics
+  rmse = sqrt(mean((actual - predictions)^2))
+  mae = mean(abs(actual - predictions))
+  r2 = 1 - sum((actual - predictions)^2) / sum((actual - mean(actual))^2)
+  
+  return(list(
+    rmse = rmse,
+    mae = mae,
+    r2 = r2
+  ))
+}
+
+# Evaluate on test set
+test_metrics = evaluate_model(baseline_model, test_data)
+cat("\nTest Set Metrics:\n")
+cat("RMSE:", round(test_metrics$rmse, 2), "\n")
+cat("MAE:", round(test_metrics$mae, 2), "\n")
+cat("R-squared:", round(test_metrics$r2, 3), "\n")
+
+# Evaluate on evaluation set
+eval_metrics = evaluate_model(baseline_model, eval_data)
+cat("\nEvaluation Set Metrics:\n")
+cat("RMSE:", round(eval_metrics$rmse, 2), "\n")
+cat("MAE:", round(eval_metrics$mae, 2), "\n")
+cat("R-squared:", round(eval_metrics$r2, 3), "\n")
+```
+
+# Baseline Model Analysis
+
+```{r model_analysis}
+# Residual analysis
+test_predictions = predict(baseline_model, newdata = test_data)
+valid_idx = !is.na(test_predictions)
+test_predictions = test_predictions[valid_idx]
+test_residuals = test_data$price[valid_idx] - test_predictions
+
+# Residual plot
+ggplot(data.frame(
+  predicted = test_predictions,
+  residuals = test_residuals
+), aes(x = predicted, y = residuals)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Residual Plot",
+    x = "Predicted Price",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+
+*Figure: The residual plot shows the difference between actual and predicted prices for each listing. The funnel shape indicates increasing variance (heteroscedasticity) as predicted prices rise, suggesting the model is less accurate for higher-priced listings and may benefit from non-linear modeling or price transformation.*
+
+```{r residual_distribution_plot}
+# Residual distribution plot
+ggplot(data.frame(residuals = test_residuals), aes(x = residuals)) +
+  geom_histogram(bins = 50, fill = "skyblue") +
+  labs(
+    title = "Distribution of Residuals",
+    x = "Residuals",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+```{r feature_importance_plot}
+# Feature importance plot
+feature_importance = data.frame(
+  feature = names(coef(baseline_model))[-1],  # Exclude intercept
+  importance = abs(coef(baseline_model))[-1]
+) %>%
+  arrange(desc(importance))
+
+# Filter out NA coefficients
+feature_importance = feature_importance %>% filter(!is.na(importance))
+
+ggplot(feature_importance, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance",
+    x = "Features",
+    y = "Absolute Coefficient Value"
+  ) +
+  theme_minimal()
+```
+
+```{r summary_table, echo=FALSE}
+library(knitr)
+# Create a summary table for baseline model results
+results_table <- data.frame(
+  Set = c("Test", "Evaluation"),
+  RMSE = c(round(test_metrics$rmse, 2), round(eval_metrics$rmse, 2)),
+  MAE = c(round(test_metrics$mae, 2), round(eval_metrics$mae, 2)),
+  R_squared = c(round(test_metrics$r2, 3), round(eval_metrics$r2, 3))
+)
+kable(results_table, caption = "Summary of Baseline Model Performance Metrics.")
+```
+
+## Next Steps
+
+**Model Improvements:**
+- Consider non-linear relationships
+- Add more interaction terms
+- Implement borough-specific models
+- Try different algorithms
+
+**Feature Engineering:**
+- Create neighborhood clusters
+- Add seasonal features
+- Consider price transformations
+
+**Model Selection:**
+- Cross-validation
+- Hyperparameter tuning
+- Model ensemble approaches

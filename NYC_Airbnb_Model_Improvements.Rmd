@@ -1,0 +1,289 @@
+---
+title: "NYC Airbnb Model Improvements"
+output: html_document
+---
+
+# Introduction
+
+This document builds on the baseline model by exploring and implementing various model improvements to better predict Airbnb prices in NYC. We address limitations observed in the baseline, such as heteroscedasticity and non-linear relationships, and aim to enhance predictive performance and interpretability.
+
+# Data Preparation
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(knitr)
+
+# Load the cleaned dataset
+bnb = read.csv("/Users/andresperez/Desktop/R Files/bnb_project/data/bnb_listing_rev.csv")
+
+# Remove ID column and duplicates
+bnb = bnb[, !(names(bnb) == "id")]
+bnb = distinct(bnb)
+
+# Remove rows with zero price or NA price
+bnb = bnb %>% filter(price > 0, !is.na(price))
+
+# Process bathrooms
+bnb = bnb %>%
+  mutate(
+    bathrooms = as.integer(sapply(strsplit(bathrooms_text, " "), "[", 1)),
+    shared = sapply(strsplit(bathrooms_text, " "), function(x) {
+      if(length(x) > 1) {
+        ifelse(x[2] == "shared", 1, 0)
+      } else {
+        0
+      }
+    })
+  )
+
+# Process dates
+bnb = bnb %>%
+  mutate(
+    last_review = mdy(last_review),
+    last_review = as.integer(last_review),
+    last_review_year = year(as.Date(last_review, origin = "1970-01-01")),
+    host_since = mdy(host_since),
+    host_since = as.integer(host_since),
+    host_since_year = year(as.Date(host_since, origin = "1970-01-01"))
+  )
+
+# Convert categorical variables to factors
+bnb = bnb %>%
+  mutate(
+    neighbourhood = as.factor(neighbourhood),
+    neighbourhood_group = as.factor(neighbourhood_group),
+    room_type = as.factor(room_type)
+  )
+
+# Add engineered features
+bnb = bnb %>%
+  mutate(
+    price_per_person = price / accommodates,
+    bed_efficiency = beds / accommodates,
+    listing_age = 2024 - host_since_year,
+    review_recency = 2024 - last_review_year,
+    room_type_shared = as.numeric(room_type == "Shared room"),
+    room_type_private = as.numeric(room_type == "Private room"),
+    room_type_entire = as.numeric(room_type == "Entire home/apt"),
+    distance_from_center = sqrt((latitude - 40.7128)^2 + (longitude - (-74.0060))^2),
+    reviews_per_month = number_of_reviews / (2024 - host_since_year)
+  )
+
+# Remove rows with NA values in key features
+bnb = bnb %>%
+  filter(!is.na(accommodates),
+         !is.na(bedrooms),
+         !is.na(beds),
+         !is.na(bathrooms),
+         !is.na(price_per_person),
+         !is.na(bed_efficiency))
+
+# Set seed and split data (same as baseline)
+set.seed(123)
+n = nrow(bnb)
+train_idx = sample(1:n, size = floor(0.6 * n))
+test_idx = sample(setdiff(1:n, train_idx), size = floor(0.2 * n))
+eval_idx = setdiff(1:n, c(train_idx, test_idx))
+train_data = bnb[train_idx, ]
+test_data = bnb[test_idx, ]
+eval_data = bnb[eval_idx, ]
+
+# Features for modeling
+features = c(
+  "accommodates", "bedrooms", "beds", "bathrooms", "shared",
+  "number_of_reviews", "last_review_year", "host_since_year",
+  "latitude", "longitude",
+  "price_per_person", "bed_efficiency", "listing_age", "review_recency",
+  "room_type_shared", "room_type_private", "room_type_entire",
+  "distance_from_center", "reviews_per_month"
+)
+
+# Remove rows with NA in any model feature or price
+target_and_features <- c("price", features)
+train_data <- train_data %>% filter(if_all(all_of(target_and_features), ~ !is.na(.)))
+test_data  <- test_data  %>% filter(if_all(all_of(target_and_features), ~ !is.na(.)))
+eval_data  <- eval_data  %>% filter(if_all(all_of(target_and_features), ~ !is.na(.)))
+```
+
+# Non-linear Models
+
+## Random Forest
+
+```{r random_forest}
+set.seed(123)
+rf_model <- randomForest(
+  as.formula(paste("price ~", paste(features, collapse = " + "))),
+  data = train_data,
+  ntree = 200,
+  importance = TRUE
+)
+
+# Predict and evaluate
+rf_pred_test <- predict(rf_model, newdata = test_data)
+rf_pred_eval <- predict(rf_model, newdata = eval_data)
+
+rf_test_rmse <- sqrt(mean((test_data$price - rf_pred_test)^2))
+rf_eval_rmse <- sqrt(mean((eval_data$price - rf_pred_eval)^2))
+
+rf_test_mae <- mean(abs(test_data$price - rf_pred_test))
+rf_eval_mae <- mean(abs(eval_data$price - rf_pred_eval))
+
+rf_test_r2 <- 1 - sum((test_data$price - rf_pred_test)^2) / sum((test_data$price - mean(test_data$price))^2)
+rf_eval_r2 <- 1 - sum((eval_data$price - rf_pred_eval)^2) / sum((eval_data$price - mean(eval_data$price))^2)
+```
+
+## Gradient Boosting (XGBoost)
+
+```{r xgboost}
+set.seed(123)
+# Prepare data for xgboost
+train_matrix <- model.matrix(price ~ . -1, data = train_data[, c("price", features)])
+test_matrix <- model.matrix(price ~ . -1, data = test_data[, c("price", features)])
+eval_matrix <- model.matrix(price ~ . -1, data = eval_data[, c("price", features)])
+
+dtrain <- xgb.DMatrix(data = train_matrix, label = train_data$price)
+dtest <- xgb.DMatrix(data = test_matrix, label = test_data$price)
+deval <- xgb.DMatrix(data = eval_matrix, label = eval_data$price)
+
+xgb_model <- xgboost(
+  data = dtrain,
+  nrounds = 200,
+  objective = "reg:squarederror",
+  verbose = 0
+)
+
+xgb_pred_test <- predict(xgb_model, dtest)
+xgb_pred_eval <- predict(xgb_model, deval)
+
+xgb_test_rmse <- sqrt(mean((test_data$price - xgb_pred_test)^2))
+xgb_eval_rmse <- sqrt(mean((eval_data$price - xgb_pred_eval)^2))
+
+xgb_test_mae <- mean(abs(test_data$price - xgb_pred_test))
+xgb_eval_mae <- mean(abs(eval_data$price - xgb_pred_eval))
+
+xgb_test_r2 <- 1 - sum((test_data$price - xgb_pred_test)^2) / sum((test_data$price - mean(test_data$price))^2)
+xgb_eval_r2 <- 1 - sum((eval_data$price - xgb_pred_eval)^2) / sum((eval_data$price - mean(eval_data$price))^2)
+```
+
+# Feature Engineering
+
+## Interaction Terms
+
+```{r interaction_terms}
+# Example: Add interaction between accommodates and room type
+train_data$acc_roomtype <- train_data$accommodates * train_data$room_type_private
+# (Repeat for test_data and eval_data if using in models)
+```
+
+## Polynomial Features
+
+```{r polynomial_features}
+# Example: Add squared term for distance from center
+train_data$distance_from_center2 <- train_data$distance_from_center^2
+# (Repeat for test_data and eval_data if using in models)
+```
+
+# Borough-Specific Models
+
+```{r borough_models}
+boroughs <- unique(train_data$neighbourhood_group)
+borough_results <- data.frame()
+for (b in boroughs) {
+  sub_train <- train_data[train_data$neighbourhood_group == b, ]
+  sub_test <- test_data[test_data$neighbourhood_group == b, ]
+  if (nrow(sub_train) > 20 && nrow(sub_test) > 10) {
+    m <- randomForest(
+      as.formula(paste("price ~", paste(features, collapse = " + "))),
+      data = sub_train, ntree = 100
+    )
+    pred <- predict(m, newdata = sub_test)
+    rmse <- sqrt(mean((sub_test$price - pred)^2))
+    borough_results <- rbind(borough_results, data.frame(Borough = b, RMSE = round(rmse, 2)))
+  }
+}
+borough_results
+```
+
+# Model Tuning and Selection
+
+```{r model_tuning}
+# Fast model tuning for reproducibility
+set.seed(123)
+ctrl <- trainControl(method = "cv", number = 2) # 2-fold CV for speed
+rf_cv <- train(
+  as.formula(paste("price ~", paste(features, collapse = " + "))),
+  data = train_data %>% sample_n(min(1000, nrow(train_data))), # use up to 1000 rows
+  method = "rf",
+  trControl = ctrl,
+  tuneLength = 1 # Only try 1 value
+)
+rf_cv
+```
+
+# Model Evaluation
+
+```{r model_evaluation, echo=FALSE}
+results_table <- data.frame(
+  Model = c("Random Forest (Test)", "Random Forest (Eval)",
+            "XGBoost (Test)", "XGBoost (Eval)"),
+  RMSE = c(round(rf_test_rmse, 2), round(rf_eval_rmse, 2),
+           round(xgb_test_rmse, 2), round(xgb_eval_rmse, 2)),
+  MAE = c(round(rf_test_mae, 2), round(rf_eval_mae, 2),
+          round(xgb_test_mae, 2), round(xgb_eval_mae, 2)),
+  R_squared = c(round(rf_test_r2, 3), round(rf_eval_r2, 3),
+                round(xgb_test_r2, 3), round(xgb_eval_r2, 3))
+)
+kable(results_table, caption = "Model Performance Comparison.")
+```
+
+## Residual Analysis and Overfitting Check
+
+Below are residual plots for both the test and evaluation sets for Random Forest and XGBoost models. If the residuals are randomly scattered around zero and show similar patterns for both sets, it suggests the model generalizes well and is not overfitting. If residuals are much larger or more structured in the evaluation set, it may indicate overfitting.
+
+```{r residual_plots_rf, fig.width=7, fig.height=4}
+# Random Forest residuals
+rf_test_resid <- test_data$price - rf_pred_test
+rf_eval_resid <- eval_data$price - rf_pred_eval
+par(mfrow = c(1, 2))
+plot(rf_pred_test, rf_test_resid, pch=16, col=rgb(0,0,0,0.4),
+     main="RF Test Residuals", xlab="Predicted Price", ylab="Residuals")
+abline(h=0, col="red", lty=2)
+plot(rf_pred_eval, rf_eval_resid, pch=16, col=rgb(0,0,0,0.4),
+     main="RF Eval Residuals", xlab="Predicted Price", ylab="Residuals")
+abline(h=0, col="red", lty=2)
+par(mfrow = c(1, 1))
+```
+
+```{r residual_plots_xgb, fig.width=7, fig.height=4}
+# XGBoost residuals
+xgb_test_resid <- test_data$price - xgb_pred_test
+xgb_eval_resid <- eval_data$price - xgb_pred_eval
+par(mfrow = c(1, 2))
+plot(xgb_pred_test, xgb_test_resid, pch=16, col=rgb(0,0,0,0.4),
+     main="XGB Test Residuals", xlab="Predicted Price", ylab="Residuals")
+abline(h=0, col="red", lty=2)
+plot(xgb_pred_eval, xgb_eval_resid, pch=16, col=rgb(0,0,0,0.4),
+     main="XGB Eval Residuals", xlab="Predicted Price", ylab="Residuals")
+abline(h=0, col="red", lty=2)
+par(mfrow = c(1, 1))
+```
+
+*Interpretation: If the residuals for the evaluation set are similar in spread and pattern to those for the test set, the model is likely not overfitting. Large differences or structured patterns in the evaluation set may indicate overfitting or model limitations.*
+
+# Discussion
+
+- Non-linear models (Random Forest, XGBoost) are compared to the baseline.
+- Feature engineering and borough-specific models are explored for further improvements.
+- Cross-validation and hyperparameter tuning are used for model selection.
+- Discuss which models performed best and why.
+
+# Next Steps
+
+- Explore additional feature engineering (seasonality, text features, etc.)
+- Try more advanced ensembling methods
+- Consider model interpretability and deployment
+- Use business context to guide further improvements 
